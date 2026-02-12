@@ -1,0 +1,5 @@
+{
+  "name": "cf-starter",
+  "title": "Cloudflare + Better Auth + D1",
+  "tagline": "Email/password auth on the edge with Cloudflare Workers and D1 SQLite"
+}
