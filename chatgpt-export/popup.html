@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChatGPT Exporter</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>ChatGPT Exporter</h1>
+        <p class="subtitle">Export all your conversations — even from Team/Business accounts</p>
+      </header>
+
+      <section class="steps">
+        <div class="step" id="step1">
+          <div class="step-number">1</div>
+          <div class="step-content">
+            <h3>Open ChatGPT</h3>
+            <p>Make sure you're logged in at chatgpt.com</p>
+            <button id="openChat">Open ChatGPT</button>
+          </div>
+        </div>
+
+        <div class="step" id="step2">
+          <div class="step-number">2</div>
+          <div class="step-content">
+            <h3>Capture Your Session</h3>
+            <p>Click the button below, then <strong>reload your ChatGPT tab</strong></p>
+            <button id="captureBtn" class="primary">Capture Session</button>
+          </div>
+        </div>
+
+        <div class="step" id="step3">
+          <div class="step-number">3</div>
+          <div class="step-content">
+            <h3>Export Conversations</h3>
+            <p>Choose your format and download everything</p>
+            <div class="export-buttons">
+              <button id="exportJson" class="primary" disabled>Export as JSON</button>
+              <button id="exportMd" class="secondary" disabled>Export as Markdown</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="status-bar" id="statusBar">
+        <div class="status-icon" id="statusIcon"></div>
+        <p id="statusMessage">Ready. Start with Step 1.</p>
+      </section>
+
+      <section class="history">
+        <p><strong>Last export:</strong> <span id="lastExport">Never</span></p>
+        <p><strong>Conversations:</strong> <span id="lastCount">—</span></p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
