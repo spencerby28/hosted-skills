@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Conversation Exporter",
+  "version": "1.0.0",
+  "description": "Export all your ChatGPT conversations to a JSON or Markdown file. Works with Team/Business accounts.",
+  "permissions": [
+    "storage",
+    "webRequest",
+    "downloads",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ChatGPT Exporter"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
