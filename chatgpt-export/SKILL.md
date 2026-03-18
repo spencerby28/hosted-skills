@@ -37,7 +37,12 @@ Guide the user through these steps. They need Google Chrome and a ChatGPT accoun
 
 ### Step 1: Download the Extension Files
 
-Create a folder on the computer and download all the extension files into it:
+**Easiest method (recommended):** Download the pre-packaged ZIP file:
+
+1. Download: [chatgpt-exporter.zip](https://skills.sb28.ai/chatgpt-export/chatgpt-exporter.zip)
+2. Unzip it — this creates a folder with all 7 required files
+
+**Alternative (command line):**
 
 ```bash
 mkdir -p ~/chatgpt-exporter
@@ -50,14 +55,6 @@ curl -O https://skills.sb28.ai/chatgpt-export/popup.css
 curl -O https://skills.sb28.ai/chatgpt-export/icon48.png
 curl -O https://skills.sb28.ai/chatgpt-export/icon128.png
 ```
-
-**For non-technical users:** If the user is not comfortable with the terminal, guide them to:
-1. Create a new empty folder on their Desktop called `chatgpt-exporter`
-2. Open each URL above in their browser (the file will display as text)
-3. Right-click > "Save As" into that folder, keeping the exact filename
-4. For the .png files, right-click the link > "Save link as"
-
-Alternatively, if the files are available as a ZIP, they can download and unzip that instead.
 
 ### Step 2: Load the Extension in Chrome
 
