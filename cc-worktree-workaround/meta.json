@@ -1,0 +1,5 @@
+{
+  "name": "cc-worktree-workaround",
+  "title": "Claude Code Worktree Workaround",
+  "tagline": "Fix worktree agents that start from main instead of your feature branch"
+}
