@@ -1,0 +1,5 @@
+{
+  "name": "arch-audit",
+  "title": "Architectural Alignment Audit",
+  "tagline": "Deep structural audit of any codebase — find split-brain behavior, schema drift, ownership gaps, and misaligned boundaries"
+}
