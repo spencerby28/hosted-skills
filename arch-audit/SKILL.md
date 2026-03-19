@@ -9,17 +9,40 @@ You are a principal engineer performing a deep structural audit of a codebase. T
 
 ## Process
 
+This audit follows a deliberate escalation pattern. Each phase reveals whether the problem is deeper than the previous phase assumed. Do not skip phases or jump to remediation.
+
 **Phase 1: Independent Discovery (do this FIRST)**
 
 Explore the entire codebase broadly. Read directory structures, key files, schemas, routes, components, tests, and scripts. Form your own conclusions about what's wrong before reading any existing planning documents, READMEs, or architecture docs.
 
-**Phase 2: Deep Analysis**
+**Phase 2: Diagnosis — Symptoms vs Disease**
 
-Narrow in on the clusters you identified. Read the actual implementations. Trace data flows. Compare contracts between layers.
+Look at what you found in Phase 1 and ask: are these **symptoms** or **root causes**? The most common trap is treating the visible problem (loose types, duplicated code, missing tests) as the disease, when the actual disease is structural (no domain layer, boundary erosion, transport shapes dictating domain logic). Distinguish:
 
-**Phase 3: Plan Comparison (do this LAST)**
+- **Symptom-level findings:** Excessive optional chaining, loose types, duplicated validation. These are real but fixing them individually doesn't prevent recurrence.
+- **Disease-level findings:** Routes owning business logic, online and offline paths implementing the same operation differently, transport shapes (forms, JSON) dictating domain structure. These are why the symptoms keep appearing.
 
-Only after you have your own diagnosis, read any existing plans, docs, or architecture files (`.cursor/plans`, `docs/`, `ARCH-*.md`, `PROGRESS.md`, etc.). Compare your findings against what was already documented. Note where existing plans are wrong, incomplete, stale, or miss a larger root cause.
+If your Phase 1 findings are mostly symptoms, dig deeper. The disease is usually one layer below.
+
+**Phase 3: Evidence Gathering — Ground-Truth Against Production**
+
+Validate your diagnosis against reality. If possible:
+- Query production data to check assumptions (does the feature even get used? how many rows actually exist?)
+- Check git history for churn patterns (files that always change together should be co-located)
+- Count actual usage of complex features — often the type surface implies far more expressiveness than production data shows
+
+Production reality checks frequently reveal that elaborate type hierarchies and complex features serve a handful of actual use cases. This changes the remediation strategy from "make the complex thing correct" to "simplify to match reality."
+
+**Phase 4: Plan Comparison (do this LAST)**
+
+Only after you have your own diagnosis, read any existing plans, docs, or architecture files (`.cursor/plans`, `docs/`, `ARCH-*.md`, `PROGRESS.md`, etc.). Compare your findings against what was already documented. For each existing plan, assess:
+
+- **Scope:** Does it address symptoms, disease, or both?
+- **Completeness:** What cross-cutting concerns does it miss?
+- **Staleness:** Does it describe the current codebase or a past version?
+- **Relationship:** Is it a useful workstream within a larger effort, or does it think it IS the whole effort?
+
+Existing plans that address symptoms are not wrong — they're incomplete. Acknowledge what they got right, then frame them as supporting workstreams inside the broader architectural fix.
 
 ## The 10 Audit Categories
 
@@ -229,6 +252,37 @@ After comparing your findings with any existing planning documents:
 - **Be opinionated.** State what the right architecture is, not just what's wrong.
 - **No fixes in this pass.** Audit only. The remediation plan tells someone else (or a future session) what to do.
 
+## The Escalation Pattern
+
+Architectural audits almost always reveal that the problem is deeper than initially assumed. This is normal and expected. The pattern:
+
+1. **Symptom reports** surface first (loose types, duplicated code, failing tests). These are real but shallow.
+2. **Diagnosis** reveals the symptoms share a structural root cause (no domain layer, boundary erosion, transport dictating domain).
+3. **Evidence gathering** reveals concrete bugs, security gaps, and behavioral divergences that the symptom-level view missed entirely.
+4. **Strategic planning** reveals additional problem classes invisible from the code level (ownership gaps, documentation drift, scope model complexity vs actual usage).
+5. **Data-grounded execution** reveals that production reality is far simpler than the type surface implies, changing the remediation from "make the complex thing correct" to "simplify to match what's actually used."
+
+At each step, resist the urge to narrow scope back to the comfortable symptom level. The audit's value is in surfacing the disease, not cataloging symptoms.
+
+### When the Problem is Deeper Than Expected
+
+If during the audit you discover the problem is fundamentally deeper than the initial framing:
+
+- **State this explicitly.** Don't bury a disease-level finding inside a symptom-level report.
+- **Reframe the audit.** The original question may have been "why are our types loose?" but the answer may be "because routes own domain logic and there's no canonical shape for anything."
+- **Preserve the symptom-level work.** Existing plans that fix symptoms are valid workstreams — they just need to be framed as part of the larger effort, not the whole effort.
+- **Name the disease.** Give it a clear, specific label ("boundary erosion," "transport-dictated domain," "split-brain execution paths"). This makes it discussable and trackable.
+
+### Deliverable Progression
+
+For complex codebases, a single audit document may not be sufficient. The natural progression is:
+
+1. **Diagnosis document** — "Here's what's wrong and why" (this audit)
+2. **Strategic convergence plan** — "Here's the target architecture and workstreams" (if the audit reveals disease-level problems)
+3. **Execution matrix** — "Here's the exact data model, interfaces, and implementation order" (if the convergence plan needs to be actioned)
+
+Each subsequent document should be grounded in the previous one. The diagnosis feeds the plan, the plan feeds the matrix. Do not produce an execution matrix without a diagnosis — you'll be fixing symptoms.
+
 ## Tips for Thorough Exploration
 
 1. Start with the directory tree — understand the intended structure before reading code.
@@ -239,3 +293,4 @@ After comparing your findings with any existing planning documents:
 6. Search for TODO/FIXME/HACK comments — they reveal known debt.
 7. Look at git log for patterns of churn — files that change together should probably be co-located.
 8. Check for orphan files — code that nothing imports or references.
+9. If possible, check production data — the actual usage patterns of complex features often reveal that the type surface dramatically overstates what's needed.
