@@ -18,6 +18,9 @@ the agent works on stale code and is missing all your branch's changes.
 
 There is no `branch` or `base_ref` parameter in the Agent tool to control this.
 
+Additionally, the auto-generated branch names (`worktree-agent-<hash>`) are opaque and
+impossible to distinguish when running multiple agents in parallel.
+
 ## Why `git checkout` Doesn't Work
 
 The obvious fix — telling the agent to `git checkout <your-branch>` — fails:
@@ -32,15 +35,17 @@ check it out.
 
 ## How It Works
 
-Use `git merge origin/<branch> --no-edit` in the agent prompt to fast-forward the
-worktree to the current branch's HEAD.
+Use `git merge` + `git branch -m` in the agent prompt to both get the right code
+AND give the branch a descriptive name.
 
 ### The Prompt Pattern
 
 Prepend this to any worktree agent prompt:
 
 ```
-BEFORE DOING ANYTHING ELSE: Run `git merge origin/<current-branch> --no-edit` to get the latest code.
+BEFORE DOING ANYTHING ELSE:
+1. Run `git merge origin/<current-branch> --no-edit` to get the latest code.
+2. Run `git branch -m worktree/<descriptive-name>` to name this branch.
 ```
 
 ### Full Agent Tool Call Example
@@ -48,10 +53,35 @@ BEFORE DOING ANYTHING ELSE: Run `git merge origin/<current-branch> --no-edit` to
 ```javascript
 Agent({
   description: "Run tests on feature branch",
-  prompt: `BEFORE DOING ANYTHING ELSE: Run \`git merge origin/feature/my-work --no-edit\` to get the latest code.\n\nThen: cd app && bun run test`,
+  prompt: `BEFORE DOING ANYTHING ELSE:\n1. Run \`git merge origin/feature/my-work --no-edit\`\n2. Run \`git branch -m worktree/run-tests\`\n\nThen: cd app && bun run test`,
   isolation: "worktree"
 })
 ```
+
+### Smart Naming Conventions
+
+Use `worktree/<purpose>` as the naming pattern:
+
+| Agent Task | Branch Name |
+|---|---|
+| Running tests | `worktree/run-tests` |
+| Refactoring auth module | `worktree/refactor-auth` |
+| Fixing scope engine bug | `worktree/fix-scope-engine` |
+| Parallel slice 3 of refactor | `worktree/slice-3-extract-types` |
+
+For parallel agents, add distinguishing suffixes:
+
+```
+worktree/slice-1-schema
+worktree/slice-2-routes
+worktree/slice-3-components
+```
+
+### Important: The Return Value Lies
+
+The `worktreeBranch` returned in the Agent tool result will still report the **old
+auto-generated name** (`worktree-agent-<hash>`). Ignore it — use the name you specified
+in the prompt.
 
 ### If Branch Isn't Pushed to Remote
 
@@ -64,38 +94,37 @@ git merge abc123def --no-edit
 
 ## Merging Worktree Changes Back
 
-After the agent completes and makes commits, merge its branch back into your current branch:
+After the agent completes and makes commits, merge its branch back using the descriptive
+name you chose:
 
 ```bash
 # From the main repo (on your feature branch):
-git merge worktree-agent-<hash> --no-edit
+git merge worktree/run-tests --no-edit
 ```
 
-This works because:
-- The worktree branch (`worktree-agent-<hash>`) is visible from the main repo
-- Since you merged your branch INTO the worktree first, merging back is a fast-forward
-- The `worktreeBranch` name is returned in the agent result when changes are made
+Much cleaner than `git merge worktree-agent-a35d659b --no-edit`.
 
 ### Full Round-Trip
 
 ```
 1. You're on `feature/my-work` at commit abc123
-2. Spawn worktree agent with merge prompt -> agent is now at abc123
-3. Agent makes changes, commits -> new commit def456 on `worktree-agent-xyz`
-4. Agent completes, returns worktreeBranch: "worktree-agent-xyz"
-5. In main repo: `git merge worktree-agent-xyz --no-edit` -> fast-forward to def456
+2. Spawn worktree agent with merge + rename prompt
+3. Agent merges to abc123, renames branch to `worktree/fix-auth`
+4. Agent makes changes, commits -> new commit def456 on `worktree/fix-auth`
+5. In main repo: `git merge worktree/fix-auth --no-edit` -> fast-forward to def456
 ```
 
 ## Test Results
 
-All approaches were tested on 2026-03-19:
+All approaches tested on 2026-03-19:
 
 | Approach | Result |
 |---|---|
 | Default worktree (no intervention) | Branches from **main** HEAD |
 | `git checkout <branch>` in prompt | **Fails** — branch already in use by main worktree |
 | `git merge origin/<branch>` in prompt | **Works** — fast-forwards to current branch HEAD |
-| Merge changes back to main repo | **Works** — fast-forward merge succeeds |
+| `git branch -m worktree/<name>` after merge | **Works** — renamed, visible from main repo |
+| Merge back using renamed branch | **Works** — fast-forward merge succeeds |
 
 ## Troubleshooting
 
@@ -107,11 +136,15 @@ work since the worktree is disposable.
 or use the commit SHA instead.
 
 **Worktree not cleaned up**: If the agent made changes, the worktree persists at
-`.claude/worktrees/agent-<hash>`. You can clean it up with `git worktree remove .claude/worktrees/agent-<hash>`.
+`.claude/worktrees/agent-<hash>`. Be careful pruning — other agents may still be using them.
+Clean up with `git worktree remove .claude/worktrees/agent-<hash>` only when you're sure
+no agents are running.
+
+**`worktreeBranch` shows old name**: Expected behavior. The return value always reports the
+original auto-generated name. Use the name you specified in your prompt instead.
 
 ## Notes
 
 - This behavior may change in future Claude Code versions if a `branch` parameter is added
-- The worktree branch name will be `worktree-agent-<hash>`, not your branch name
-- For parallel worktree agents, each one needs the merge step independently
+- For parallel worktree agents, each one needs the merge + rename step independently
 - If your branch has diverged from main (not a fast-forward), the merge creates a merge commit — this is fine for read-only or disposable worktree work
