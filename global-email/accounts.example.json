@@ -1,0 +1,33 @@
+{
+  "accounts": [
+    {
+      "id": "gmail-primary",
+      "provider": "gmail",
+      "email": "primary@example.com",
+      "client_secret_path": "~/.codex/global-email/google-oauth-client.json",
+      "token_path": "~/.codex/global-email/tokens/gmail-primary.json"
+    },
+    {
+      "id": "gmail-secondary",
+      "provider": "gmail",
+      "email": "secondary@example.com",
+      "client_secret_path": "~/.codex/global-email/google-oauth-client.json",
+      "token_path": "~/.codex/global-email/tokens/gmail-secondary.json"
+    },
+    {
+      "id": "icloud",
+      "provider": "imap",
+      "email": "custom-domain-or-icloud-address@example.com",
+      "username": "primary-icloud-mail-address@icloud.com",
+      "imap_host": "imap.mail.me.com",
+      "imap_port": 993,
+      "mailbox": "INBOX",
+      "drafts_mailbox": "Drafts",
+      "sent_mailbox": "Sent Messages",
+      "smtp_host": "smtp.mail.me.com",
+      "smtp_port": 587,
+      "smtp_username": "primary-icloud-mail-address@icloud.com",
+      "password_env": "ICLOUD_APP_PASSWORD"
+    }
+  ]
+}

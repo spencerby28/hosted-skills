@@ -21,6 +21,7 @@ Claude reads the instructions and walks you through it step by step.
 | [cf-starter](https://skills.sb28.ai/cf-starter) | Email/password auth on the edge with Cloudflare Workers and D1 SQLite |
 | [pdf-reader](https://skills.sb28.ai/pdf-reader) | Extract content and visual styling from PDFs using Marker + Vision |
 | [security-check](https://skills.sb28.ai/security-check) | Non-technical security audit for OpenClaw setups |
+| [global-email](https://skills.sb28.ai/global-email) | Local multi-account email bridge for Gmail and iCloud, with search, read, drafts, and confirmed sending |
 
 ## Skill Structure
 
