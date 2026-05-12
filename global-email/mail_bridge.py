@@ -455,8 +455,44 @@ def gmail_send(account: dict[str, Any], args: argparse.Namespace) -> dict[str, A
         subject=args.subject,
         body=read_body_arg(args),
     )
+
+    thread_id = getattr(args, "thread_id", None)
+    reply_message_id = getattr(args, "reply_message_id", None)
+    if reply_message_id:
+        source = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=reply_message_id,
+                format="metadata",
+                metadataHeaders=["Message-ID", "References", "Subject"],
+            )
+            .execute()
+        )
+        thread_id = thread_id or source.get("threadId")
+        headers = {
+            h.get("name", "").lower(): h.get("value", "")
+            for h in source.get("payload", {}).get("headers", [])
+        }
+        source_message_id = headers.get("message-id")
+        if source_message_id:
+            refs = headers.get("references")
+            if message.get("In-Reply-To"):
+                message.replace_header("In-Reply-To", source_message_id)
+            else:
+                message["In-Reply-To"] = source_message_id
+            ref_value = f"{refs} {source_message_id}".strip() if refs else source_message_id
+            if message.get("References"):
+                message.replace_header("References", ref_value)
+            else:
+                message["References"] = ref_value
+
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    send_body: dict[str, Any] = {"raw": raw}
+    if thread_id:
+        send_body["threadId"] = thread_id
+    sent = service.users().messages().send(userId="me", body=send_body).execute()
     return {
         "account": account_id(account),
         "account_email": account.get("email"),
@@ -671,6 +707,27 @@ def smtp_send(account: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     if not args.to:
         raise BridgeError("send requires --to.")
     from_addr = args.from_addr or account.get("email")
+
+    reply_to_mid: str | None = None
+    references: str | None = None
+    reply_message_id = getattr(args, "reply_message_id", None)
+    if reply_message_id:
+        conn = imap_connect(account)
+        try:
+            status, data = conn.uid("FETCH", reply_message_id.encode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES)])")
+            if status == "OK":
+                for item in data:
+                    if isinstance(item, tuple):
+                        hdr = email.message_from_bytes(item[1])
+                        reply_to_mid = normalize_header(hdr.get("Message-ID"))
+                        references = normalize_header(hdr.get("References"))
+                        break
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
     message = build_plain_message(
         from_addr=from_addr,
         to=args.to,
@@ -678,6 +735,8 @@ def smtp_send(account: dict[str, Any], args: argparse.Namespace) -> dict[str, An
         bcc=args.bcc,
         subject=args.subject,
         body=read_body_arg(args),
+        reply_to_message_id=reply_to_mid,
+        references=references,
     )
     host = str(account.get("smtp_host") or "smtp.mail.me.com")
     port = int(account.get("smtp_port") or 587)
@@ -928,6 +987,8 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--subject", required=True, help="Subject.")
     send.add_argument("--body", help="Plain text body.")
     send.add_argument("--body-file", help="Plain text body file, or '-' for stdin.")
+    send.add_argument("--reply-message-id", help="Gmail message id or IMAP UID to reply to (sets In-Reply-To/References headers and thread).")
+    send.add_argument("--thread-id", help="Existing Gmail thread id.")
     send.add_argument("--from", dest="from_addr", help="From address or verified send-as alias.")
     send.set_defaults(func=cmd_send)
 
