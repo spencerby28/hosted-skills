@@ -1,0 +1,26 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT="${GLOBAL_EMAIL_HOME:-$HOME/.codex/global-email}"
+PYTHON_BIN="${GLOBAL_EMAIL_PYTHON:-$ROOT/.venv/bin/python}"
+
+if [ "${GLOBAL_EMAIL_SCRIPT:-}" ]; then
+  SCRIPT="$GLOBAL_EMAIL_SCRIPT"
+elif [ -f "$ROOT/mail_bridge.py" ]; then
+  SCRIPT="$ROOT/mail_bridge.py"
+else
+  SCRIPT="$HOME/.codex/skills/global-email/scripts/mail_bridge.py"
+fi
+
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "global-email: missing Python virtualenv at $PYTHON_BIN" >&2
+  echo "Run: uv venv --python 3.13 $ROOT/.venv" >&2
+  exit 127
+fi
+
+if [ ! -f "$SCRIPT" ]; then
+  echo "global-email: missing mail bridge script at $SCRIPT" >&2
+  exit 127
+fi
+
+exec "$PYTHON_BIN" "$SCRIPT" "$@"

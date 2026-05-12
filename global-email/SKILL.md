@@ -29,6 +29,7 @@ Download the toolkit ZIP or fetch individual files from:
 | File | Purpose |
 |---|---|
 | [`global-email-toolkit.zip`](https://skills.sb28.ai/global-email/global-email-toolkit.zip) | Prepackaged bridge files |
+| [`global-email`](https://skills.sb28.ai/global-email/global-email) | Short launcher so users can run `global-email search ...` |
 | [`mail_bridge.py`](https://skills.sb28.ai/global-email/mail_bridge.py) | Local CLI for Gmail/iCloud search, read, drafts, and send |
 | [`requirements.txt`](https://skills.sb28.ai/global-email/requirements.txt) | Python Gmail API dependencies |
 | [`accounts.example.json`](https://skills.sb28.ai/global-email/accounts.example.json) | Safe starter config with no secrets |
@@ -62,7 +63,12 @@ Download and unpack the toolkit:
 cd ~/.codex/global-email
 curl -L -o global-email-toolkit.zip https://skills.sb28.ai/global-email/global-email-toolkit.zip
 python3 -m zipfile -e global-email-toolkit.zip .
+chmod +x ~/.codex/global-email/global-email
+mkdir -p ~/.local/bin
+ln -sf ~/.codex/global-email/global-email ~/.local/bin/global-email
 ```
+
+If `~/.local/bin` is not on `PATH`, add it to the shell profile or use `~/.local/bin/global-email ...`.
 
 Create the `uv` virtual environment:
 
@@ -116,12 +122,12 @@ chmod 600 ~/.codex/global-email/google-oauth-client.json
 Create one token per Gmail account:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py setup-gmail \
+global-email setup-gmail \
   --client-secret ~/.codex/global-email/google-oauth-client.json \
   --token-path ~/.codex/global-email/tokens/gmail-primary.json \
   --scope-set compose
 
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py setup-gmail \
+global-email setup-gmail \
   --client-secret ~/.codex/global-email/google-oauth-client.json \
   --token-path ~/.codex/global-email/tokens/gmail-secondary.json \
   --scope-set compose
@@ -204,7 +210,7 @@ For iCloud, set:
 Run:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py accounts
+global-email accounts
 ```
 
 Every account should show `ready: true`.
@@ -212,13 +218,13 @@ Every account should show `ready: true`.
 Search the last day:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py search --days 1 --limit 10
+global-email search --days 1 --limit 10
 ```
 
 Search one account:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py search \
+global-email search \
   --account gmail-primary \
   --query "from:example.com" \
   --days 30 \
@@ -228,7 +234,7 @@ Search one account:
 Read one message using the `message_id` from search:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py read \
+global-email read \
   --account gmail-primary \
   --message-id MESSAGE_ID
 ```
@@ -238,7 +244,7 @@ Read one message using the `message_id` from search:
 Create a draft:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py create-draft \
+global-email create-draft \
   --account gmail-primary \
   --to recipient@example.com \
   --subject "Subject" \
@@ -248,7 +254,7 @@ Create a draft:
 Send only after explicit confirmation:
 
 ```bash
-~/.codex/global-email/.venv/bin/python ~/.codex/global-email/mail_bridge.py send \
+global-email send \
   --account icloud \
   --to recipient@example.com \
   --subject "Subject" \
