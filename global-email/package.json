@@ -1,0 +1,17 @@
+{
+  "name": "global-email",
+  "version": "0.3.0",
+  "description": "Local multi-account mail bridge (Gmail API + iCloud IMAP/SMTP) for AI assistants: search, read, attachments, drafts, send, and Gmail cleanup.",
+  "license": "UNLICENSED",
+  "repository": "github:spencerby28/hosted-skills",
+  "bin": {
+    "global-email": "bin/global-email"
+  },
+  "files": [
+    "bin/global-email",
+    "mail_bridge.py",
+    "requirements.txt",
+    "accounts.example.json",
+    "SKILL.md"
+  ]
+}

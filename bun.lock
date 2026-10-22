@@ -1,0 +1,19 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "hosted-skills",
+    },
+    "global-email": {
+      "name": "global-email",
+      "version": "0.3.0",
+      "bin": {
+        "global-email": "bin/global-email",
+      },
+    },
+  },
+  "packages": {
+    "global-email": ["global-email@workspace:global-email"],
+  }
+}

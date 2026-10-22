@@ -1,0 +1,37 @@
+#!/bin/sh
+# Installed launcher: runs this package's mail_bridge.py with the global-email Python venv.
+#   global-email setup-venv   create $GLOBAL_EMAIL_HOME/.venv and install requirements.txt
+set -eu
+
+# Resolve symlinks (npm/bun link bins) without GNU readlink -f, so this works on macOS.
+src=$0
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+here=$(cd -P "$(dirname "$src")/.." && pwd)
+
+ROOT=${GLOBAL_EMAIL_HOME:-$HOME/.codex/global-email}
+SCRIPT=${GLOBAL_EMAIL_SCRIPT:-$here/mail_bridge.py}
+
+if [ "${1:-}" = "setup-venv" ]; then
+  mkdir -p "$ROOT"
+  if command -v uv >/dev/null 2>&1; then
+    uv venv --python 3.13 "$ROOT/.venv"
+    uv pip install --python "$ROOT/.venv/bin/python" -r "$here/requirements.txt"
+  else
+    python3 -m venv "$ROOT/.venv"
+    "$ROOT/.venv/bin/python" -m pip install -r "$here/requirements.txt"
+  fi
+  [ -f "$ROOT/accounts.json" ] || echo "Next: copy $here/accounts.example.json to $ROOT/accounts.json and edit it."
+  exit 0
+fi
+
+PYTHON_BIN=${GLOBAL_EMAIL_PYTHON:-$ROOT/.venv/bin/python}
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "global-email: missing Python virtualenv at $PYTHON_BIN" >&2
+  echo "Run: global-email setup-venv" >&2
+  exit 127
+fi
+exec "$PYTHON_BIN" "$SCRIPT" "$@"
