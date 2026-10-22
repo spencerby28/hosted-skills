@@ -877,6 +877,30 @@ def gmail_list_ids(service: Any, query: str, limit: int, include_spam_trash: boo
     return ids[:limit] if limit > 0 else ids
 
 
+def execute_with_retry(call, label: str, attempts: int = 6):
+    """Retry transient network failures (DNS, resets) with backoff; API errors still raise."""
+    import random
+    import socket
+    import time
+
+    transient: tuple[type[BaseException], ...] = (OSError, socket.gaierror, TimeoutError)
+    try:
+        import httplib2
+
+        transient += (httplib2.ServerNotFoundError,)
+    except ImportError:
+        pass
+    for attempt in range(attempts):
+        try:
+            return call()
+        except transient as exc:
+            if attempt == attempts - 1:
+                raise
+            wait = min(30, 2**attempt + random.random())
+            print(f"{label}: network error ({type(exc).__name__}); retrying in {wait:.0f}s", file=sys.stderr)
+            time.sleep(wait)
+
+
 def run_batches(service: Any, ids: list[str], make_request, chunk: int, label: str) -> tuple[list[str], list[str]]:
     """Run per-message requests in HTTP batches; retry failed ids with backoff. Returns (done, failed)."""
     import random
@@ -987,7 +1011,7 @@ def gmail_clean(account: dict[str, Any], args: argparse.Namespace, service: Any 
                     ),
                     request_id=message_id,
                 )
-            batch.execute()
+            execute_with_retry(batch.execute, "size sample")
         for message_id, detail in details.items():
             sizes.append(int(detail.get("sizeEstimate") or 0))
             sender = gmail_headers(detail.get("payload", {})).get("from", "")
