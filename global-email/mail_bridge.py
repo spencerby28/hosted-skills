@@ -28,6 +28,24 @@ CONFIG_PATH = Path(
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+# Full mailbox access; the only scope that allows permanent deletion (messages.batchDelete).
+GMAIL_FULL_SCOPE = "https://mail.google.com/"
+GMAIL_SCOPE_SETS = {
+    "readonly": [GMAIL_READONLY_SCOPE],
+    "compose": [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE],
+    "modify": [GMAIL_MODIFY_SCOPE],
+    "full": [GMAIL_FULL_SCOPE],
+}
+# Scopes that allow each clean action. Trash/untrash/label/archive need modify (or full);
+# permanent delete needs full.
+CLEAN_ACTION_SCOPES = {
+    "trash": {GMAIL_MODIFY_SCOPE, GMAIL_FULL_SCOPE},
+    "untrash": {GMAIL_MODIFY_SCOPE, GMAIL_FULL_SCOPE},
+    "archive": {GMAIL_MODIFY_SCOPE, GMAIL_FULL_SCOPE},
+    "label": {GMAIL_MODIFY_SCOPE, GMAIL_FULL_SCOPE},
+    "delete": {GMAIL_FULL_SCOPE},
+}
+CLEAN_DEFAULT_PROTECTED_LABELS = ["STARRED"]
 GMAIL_METADATA_HEADERS = ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"]
 # Read calls retry 429/5xx/rateLimitExceeded with jittered exponential backoff (rand * 2**n s).
 # The Gmail per-user bucket is shared by every process using the same account + OAuth project,
@@ -811,6 +829,213 @@ def gmail_send(account: dict[str, Any], args: argparse.Namespace) -> dict[str, A
     }
 
 
+def gmail_token_scopes(account: dict[str, Any]) -> set[str]:
+    token_path = Path(str(account.get("token_path") or "")).expanduser()
+    try:
+        return set(json.loads(token_path.read_text()).get("scopes") or [])
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def clean_protections(account: dict[str, Any], args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    senders = arg_values(account.get("protected_senders")) + arg_values(getattr(args, "protect_sender", None))
+    labels = list(CLEAN_DEFAULT_PROTECTED_LABELS)
+    labels += arg_values(account.get("protected_labels")) + arg_values(getattr(args, "protect_label", None))
+    dedupe = lambda items: list(dict.fromkeys(items))  # noqa: E731
+    return dedupe(senders), dedupe(labels)
+
+
+def clean_query(base_query: str, senders: list[str], labels: list[str], action: str) -> str:
+    """Wrap the caller's query and exclude protected senders/labels in Gmail search itself."""
+    if not base_query.strip():
+        raise BridgeError("clean requires a non-empty --query.")
+    parts = [f"({base_query.strip()})"]
+    for sender in senders:
+        parts.append(f"-from:{gmail_query_value(sender)}")
+    for label in labels:
+        parts.append("-is:starred" if label.upper() == "STARRED" else f"-label:{gmail_query_value(label)}")
+    if action == "untrash":
+        parts.append("in:trash")
+    return " ".join(parts)
+
+
+def gmail_list_ids(service: Any, query: str, limit: int, include_spam_trash: bool) -> list[str]:
+    ids: list[str] = []
+    page_token = None
+    while limit <= 0 or len(ids) < limit:
+        page = min(500, limit - len(ids)) if limit > 0 else 500
+        response = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=page, pageToken=page_token, includeSpamTrash=include_spam_trash)
+            .execute(num_retries=GMAIL_READ_RETRIES)
+        )
+        ids.extend(item["id"] for item in response.get("messages", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return ids[:limit] if limit > 0 else ids
+
+
+def run_batches(service: Any, ids: list[str], make_request, chunk: int, label: str) -> tuple[list[str], list[str]]:
+    """Run per-message requests in HTTP batches; retry failed ids with backoff. Returns (done, failed)."""
+    import random
+    import time
+
+    done: list[str] = []
+    pending = list(ids)
+    for attempt in range(GMAIL_READ_RETRIES + 1):
+        failed: list[str] = []
+        for start in range(0, len(pending), chunk):
+            group = pending[start : start + chunk]
+
+            def callback(request_id: str, _response: Any, exception: Exception | None) -> None:
+                (failed if exception is not None else done).append(request_id)
+
+            batch = service.new_batch_http_request(callback=callback)
+            for message_id in group:
+                batch.add(make_request(message_id), request_id=message_id)
+            try:
+                batch.execute()
+            except Exception:  # whole batch failed (network/quota); retry all of it
+                failed.extend(mid for mid in group if mid not in done and mid not in failed)
+        if not failed:
+            return done, []
+        pending = failed
+        time.sleep(min(64, random.random() * 2**attempt + 1))
+    print(f"{label}: {len(pending)} ids still failing after retries", file=sys.stderr)
+    return done, pending
+
+
+def gmail_clean(account: dict[str, Any], args: argparse.Namespace, service: Any = None) -> dict[str, Any]:
+    action = args.action
+    senders, labels = clean_protections(account, args)
+    query = clean_query(args.query, senders, labels, action)
+    include_spam_trash = action in {"delete", "untrash"} or bool(re.search(r"\bin:(trash|spam)\b", args.query))
+    if args.execute:
+        granted = gmail_token_scopes(account)
+        if not granted & CLEAN_ACTION_SCOPES[action]:
+            needed = "full" if action == "delete" else "modify"
+            raise BridgeError(
+                f"{account_id(account)} token lacks a scope for '{action}'. "
+                f"Rerun: global-email setup-gmail --account {account_id(account)} --scope-set {needed}"
+            )
+        if action == "label" and not (args.add_label or args.remove_label):
+            raise BridgeError("--action label needs --add-label and/or --remove-label.")
+    service = service or gmail_service(account)
+    ids = gmail_list_ids(service, query, args.limit, include_spam_trash)
+    result: dict[str, Any] = {
+        "account": account_id(account),
+        "action": action,
+        "query": query,
+        "protected_senders": senders,
+        "protected_labels": labels,
+        "matched": len(ids),
+        "limit": args.limit,
+        "matched_is_capped": args.limit > 0 and len(ids) >= args.limit,
+        "dry_run": not args.execute,
+    }
+
+    # Size estimate and sender breakdown from a sample (messages.get costs quota per message).
+    sample_ids = ids[: args.size_sample] if args.size_sample > 0 else ids
+    sizes: list[int] = []
+    senders_seen: dict[str, int] = {}
+    leaked: list[str] = []
+    protected_lower = [s.lower() for s in senders]
+
+    # Sampled on dry runs and before executing, so the guard check also runs right before any change.
+    if sample_ids:
+        details: dict[str, Any] = {}
+
+        def collect(request_id: str, response: Any, exception: Exception | None) -> None:
+            if exception is None:
+                details[request_id] = response
+
+        for start in range(0, len(sample_ids), 50):
+            batch = service.new_batch_http_request(callback=collect)
+            for message_id in sample_ids[start : start + 50]:
+                batch.add(
+                    service.users().messages().get(
+                        userId="me", id=message_id, format="metadata", metadataHeaders=["From"]
+                    ),
+                    request_id=message_id,
+                )
+            batch.execute()
+        for message_id, detail in details.items():
+            sizes.append(int(detail.get("sizeEstimate") or 0))
+            sender = gmail_headers(detail.get("payload", {})).get("from", "")
+            senders_seen[sender] = senders_seen.get(sender, 0) + 1
+            if any(p in sender.lower() for p in protected_lower) or (
+                "STARRED" in labels and "STARRED" in (detail.get("labelIds") or [])
+            ):
+                leaked.append(message_id)
+        sampled = len(sizes)
+        total = sum(sizes)
+        estimate = int(total * len(ids) / sampled) if sampled else 0
+        result.update(
+            {
+                "size_sampled": sampled,
+                "size_bytes_sampled": total,
+                "size_bytes_estimated": estimate,
+                "size_mb_estimated": round(estimate / 1_000_000, 1),
+                "size_is_estimate": sampled < len(ids),
+                "top_senders": sorted(senders_seen.items(), key=lambda kv: -kv[1])[:15],
+                "protected_matches_in_sample": len(leaked),
+            }
+        )
+        if leaked:
+            raise BridgeError(
+                f"Guard tripped: {len(leaked)} sampled messages match protected senders/labels; nothing was changed."
+            )
+
+    if not args.execute:
+        result["note"] = "Dry run: nothing changed. Re-run with --execute to apply."
+        return result
+
+    users = service.users().messages()
+    if action == "delete":
+        done: list[str] = []
+        for start in range(0, len(ids), 1000):
+            group = ids[start : start + 1000]
+            users.batchDelete(userId="me", body={"ids": group}).execute(num_retries=GMAIL_READ_RETRIES)
+            done.extend(group)
+        failed: list[str] = []
+    elif action in {"archive", "label"}:
+        body: dict[str, list[str]] = {}
+        if action == "archive":
+            body["removeLabelIds"] = ["INBOX"]
+        else:
+            if args.add_label:
+                body["addLabelIds"] = arg_values(args.add_label)
+            if args.remove_label:
+                body["removeLabelIds"] = arg_values(args.remove_label)
+        done = []
+        for start in range(0, len(ids), 1000):
+            group = ids[start : start + 1000]
+            users.batchModify(userId="me", body={"ids": group, **body}).execute(num_retries=GMAIL_READ_RETRIES)
+            done.extend(group)
+        failed = []
+    else:  # trash / untrash: per-message endpoints, sent in HTTP batches
+        method = users.trash if action == "trash" else users.untrash
+        done, failed = run_batches(service, ids, lambda mid: method(userId="me", id=mid), 50, action)
+
+    if args.manifest:
+        manifest = Path(args.manifest).expanduser()
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("a") as handle:
+            stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+            for message_id in done:
+                handle.write(json.dumps({"at": stamp, "account": account_id(account), "action": action, "id": message_id}) + "\n")
+        result["manifest"] = str(manifest)
+    result.update({"applied": len(done), "failed": len(failed), "failed_ids": failed[:50]})
+    if action == "trash":
+        result["note"] = (
+            "Trashed messages still count toward storage until Trash is emptied (Gmail empties it after 30 days). "
+            "Undo with --action untrash."
+        )
+    return result
+
+
 def password_for_imap(account: dict[str, Any]) -> str:
     if account.get("password_env"):
         value = os.environ.get(str(account["password_env"]))
@@ -1309,21 +1534,35 @@ def cmd_send(args: argparse.Namespace) -> None:
     json_print({"ok": True, "sent": result})
 
 
+def cmd_clean(args: argparse.Namespace) -> None:
+    config = load_config(Path(args.config).expanduser())
+    selected = select_accounts(config, [args.account])
+    if len(selected) != 1 or str(selected[0].get("provider") or "").lower() != "gmail":
+        raise BridgeError("clean requires exactly one Gmail account.")
+    json_print({"ok": True, "clean": gmail_clean(selected[0], args)})
+
+
 def cmd_setup_gmail(args: argparse.Namespace) -> None:
     _, _, InstalledAppFlow, _ = require_google_libs()
-    client_secret = Path(args.client_secret).expanduser()
-    token_path = Path(args.token_path).expanduser()
+    client_secret_arg, token_path_arg = args.client_secret, args.token_path
+    if args.account:
+        config = load_config(Path(args.config).expanduser())
+        selected = select_accounts(config, [args.account])
+        if len(selected) != 1 or str(selected[0].get("provider") or "").lower() != "gmail":
+            raise BridgeError("--account must name exactly one Gmail account.")
+        client_secret_arg = client_secret_arg or selected[0].get("client_secret_path")
+        token_path_arg = token_path_arg or selected[0].get("token_path")
+    if not client_secret_arg or not token_path_arg:
+        raise BridgeError("Pass --account, or both --client-secret and --token-path.")
+    client_secret = Path(str(client_secret_arg)).expanduser()
+    token_path = Path(str(token_path_arg)).expanduser()
     if not client_secret.exists():
         raise BridgeError(f"Client secret JSON not found: {client_secret}")
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    if args.scope_set == "readonly":
-        scopes = [GMAIL_READONLY_SCOPE]
-    elif args.scope_set == "compose":
-        scopes = [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE]
-    else:
-        scopes = [GMAIL_MODIFY_SCOPE]
+    scopes = GMAIL_SCOPE_SETS[args.scope_set]
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), scopes)
     creds = flow.run_local_server(port=0, open_browser=not args.no_browser)
+    # The token is only replaced after consent succeeds.
     token_path.write_text(creds.to_json())
     json_print({"ok": True, "token_path": str(token_path), "scopes": scopes})
 
@@ -1424,14 +1663,50 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--from", dest="from_addr", help="From address or verified send-as alias.")
     send.set_defaults(func=cmd_send)
 
-    setup_gmail = sub.add_parser("setup-gmail", help="Create a Gmail OAuth token.")
-    setup_gmail.add_argument("--client-secret", required=True, help="Google OAuth desktop client JSON.")
-    setup_gmail.add_argument("--token-path", required=True, help="Where to write the account token JSON.")
+    clean = sub.add_parser(
+        "clean",
+        help="Query-driven Gmail cleanup (trash by default). Dry run unless --execute.",
+    )
+    add_common_config_arg(clean)
+    clean.add_argument("--account", required=True, help="Gmail account id or email.")
+    clean.add_argument("--query", required=True, help="Gmail search query selecting the messages.")
+    clean.add_argument(
+        "--action",
+        choices=sorted(CLEAN_ACTION_SCOPES),
+        default="trash",
+        help="trash (default, undoable), untrash, archive, label, or delete (permanent; needs --scope-set full).",
+    )
+    clean.add_argument("--add-label", action="append", help="Label id to add (with --action label).")
+    clean.add_argument("--remove-label", action="append", help="Label id to remove (with --action label).")
+    clean.add_argument("--protect-sender", action="append", help="Never touch mail from this sender. Repeatable.")
+    clean.add_argument("--protect-label", action="append", help="Never touch mail with this label. Repeatable.")
+    clean.add_argument("--limit", type=int, default=5000, help="Maximum messages to act on (0 = no limit).")
+    clean.add_argument(
+        "--size-sample",
+        type=int,
+        default=300,
+        help="Messages fetched to estimate size and check guards (0 = all matches).",
+    )
+    clean.add_argument("--manifest", help="Append acted-on message ids (JSONL) to this file.")
+    mode = clean.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Count and size only (the default).")
+    mode.add_argument("--execute", action="store_true", help="Apply the action.")
+    clean.set_defaults(func=cmd_clean)
+
+    setup_gmail = sub.add_parser("setup-gmail", help="Create or replace a Gmail OAuth token.")
+    add_common_config_arg(setup_gmail)
+    setup_gmail.add_argument("--account", help="Configured Gmail account; supplies the client secret and token paths.")
+    setup_gmail.add_argument("--client-secret", help="Google OAuth desktop client JSON.")
+    setup_gmail.add_argument("--token-path", help="Where to write the account token JSON.")
     setup_gmail.add_argument(
         "--scope-set",
-        choices=["readonly", "compose", "modify"],
+        choices=sorted(GMAIL_SCOPE_SETS),
         default="compose",
-        help="OAuth scopes to request. Default compose supports search/read and draft creation.",
+        help=(
+            "OAuth scopes to request. compose (default): search/read, drafts, send. "
+            "modify: also trash/untrash/archive/label for `clean`. "
+            "full (https://mail.google.com/): also permanent delete; grants complete mailbox control."
+        ),
     )
     setup_gmail.add_argument(
         "--no-browser",

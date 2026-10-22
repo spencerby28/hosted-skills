@@ -23,6 +23,8 @@ through a small Python CLI, and outbound email is only sent after explicit user 
 - Filter searches directly by recipient email across To/Cc/Bcc.
 - Create Gmail or iCloud drafts.
 - Send through Gmail API or iCloud SMTP after the user confirms recipients, subject, and body.
+- Save message attachments to disk, with optional PDF text extraction.
+- Query-driven Gmail cleanup (`clean`): dry-run count and size, then trash, archive, label or permanently delete, with protected senders/labels.
 - A repeatable Google OAuth setup path each user can own for themselves.
 - A bridge that other agents can call with simple JSON output.
 
@@ -45,6 +47,7 @@ Download the toolkit ZIP or fetch individual files from:
 - Do not reuse someone else's Google OAuth client for friends. Each user should create their own Google Cloud project and Desktop OAuth client.
 - Treat email as read-first. Create drafts only when asked. Send mail only after the user explicitly confirms the exact recipients, subject, and body.
 - If a command returns email snippets, summarize only what is needed for the task.
+- `clean` is a dry run unless `--execute` is passed. Show the user the dry-run count, size and top senders, and get explicit approval of the exact query and action before executing. Prefer `trash` (undoable) over `delete` (permanent).
 
 ## Setup Overview
 
@@ -143,7 +146,14 @@ Scope guidance:
 
 - `readonly`: search and read only.
 - `compose`: search/read plus draft and send access. This is the practical default for assistant workflows.
-- `modify`: broader Gmail modify scope for label/archive/message mutation. Avoid unless needed.
+- `modify`: everything in compose, plus trash/untrash/archive/label. Needed for `clean` (default action `trash`).
+- `full` (`https://mail.google.com/`): complete mailbox control, including permanent delete (`clean --action delete`). Request it only when trash is not enough, e.g. storage must be freed before Gmail's 30-day automatic Trash emptying.
+
+Re-consent one account with a broader scope (the token is replaced only after consent succeeds):
+
+```bash
+global-email setup-gmail --account gmail-personal --scope-set modify
+```
 
 ## iCloud Mail Setup
 
@@ -300,6 +310,29 @@ global-email read \
   --save-attachments /path/to/new-empty-dir \
   --pdf-text
 ```
+
+## Clean Up Gmail
+
+`clean` selects messages with a Gmail query, then acts on them in batches. It is a dry run unless `--execute` is given.
+
+```bash
+# 1. Dry run: matched count (capped by --limit), estimated size from a sample, top senders.
+global-email clean --account gmail-personal --query "category:promotions older_than:1y" --limit 0
+
+# 2. Trash them (undoable for 30 days with --action untrash). Keep a manifest of ids.
+global-email clean --account gmail-personal --query "category:promotions older_than:1y" --limit 0 \
+  --execute --manifest ~/mail-clean/manifest.jsonl
+
+# 3. Free the storage now instead of in 30 days (needs --scope-set full): permanently delete Trash.
+global-email clean --account gmail-personal --query "in:trash" --action delete --limit 0 --execute
+```
+
+- Starred mail is always excluded. Add `--protect-sender` / `--protect-label`, or set `protected_senders` /
+  `protected_labels` on the account in `accounts.json`. Exclusions are added to the Gmail query, and a sample of the
+  matched messages is checked again right before any change. If a protected message shows up, nothing is changed.
+- Trashed mail still counts toward storage until Trash is emptied. Gmail empties it automatically after 30 days.
+- Other actions: `archive` (remove from Inbox), `label --add-label ID --remove-label ID`, `untrash`.
+- Each action checks the token's scopes first and names the `setup-gmail` command to run if a scope is missing.
 
 ## Draft And Send
 
