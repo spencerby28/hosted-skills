@@ -1,0 +1,4 @@
+interface:
+  display_name: "Global Email"
+  short_description: "Search mail across Gmail and iCloud accounts"
+  default_prompt: "Use $global-email to show my recent emails across all configured accounts."

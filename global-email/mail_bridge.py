@@ -28,7 +28,11 @@ CONFIG_PATH = Path(
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
-GMAIL_METADATA_HEADERS = ["From", "To", "Cc", "Subject", "Date", "Message-ID"]
+GMAIL_METADATA_HEADERS = ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"]
+# Read calls retry 429/5xx/rateLimitExceeded with jittered exponential backoff (rand * 2**n s).
+# The Gmail per-user bucket is shared by every process using the same account + OAuth project,
+# so a bulk scan elsewhere can exhaust it. Sends and draft creation are never retried.
+GMAIL_READ_RETRIES = int(os.environ.get("GLOBAL_EMAIL_GMAIL_RETRIES", "6"))
 
 
 class BridgeError(Exception):
@@ -99,6 +103,7 @@ def headers_from_message(msg: email.message.Message) -> dict[str, str]:
         "from": normalize_header(msg.get("From")),
         "to": normalize_header(msg.get("To")),
         "cc": normalize_header(msg.get("Cc")),
+        "bcc": normalize_header(msg.get("Bcc")),
         "subject": normalize_header(msg.get("Subject")),
         "date": normalize_header(msg.get("Date")),
         "message_id_header": normalize_header(msg.get("Message-ID")),
@@ -151,11 +156,188 @@ def body_from_email_message(msg: email.message.Message) -> str:
     return "\n\n".join(p for p in plain_parts if p) or "\n\n".join(p for p in html_parts if p)
 
 
+def email_message_attachments(msg: email.message.Message) -> list[tuple[dict[str, Any], bytes]]:
+    """Return (metadata, payload) for each named or attachment-disposition leaf part."""
+    found: list[tuple[dict[str, Any], bytes]] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = normalize_header(part.get_filename()) if part.get_filename() else ""
+        if not filename and part.get_content_disposition() != "attachment":
+            continue
+        payload = part.get_payload(decode=True) or b""
+        meta = {
+            "index": len(found),
+            "filename": filename,
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        }
+        found.append((meta, payload))
+    return found
+
+
+def safe_attachment_name(meta: dict[str, Any]) -> str:
+    # Attachment names come from the sender: keep only a plain basename.
+    name = Path(str(meta.get("filename") or "").replace("\\", "/")).name
+    name = re.sub(r"[^\w.()+\- ]", "_", name).strip(" .")
+    if not name:
+        subtype = str(meta.get("content_type") or "application/octet-stream").split("/")[-1]
+        name = f"attachment-{meta['index']}.{re.sub(r'[^A-Za-z0-9]', '', subtype) or 'bin'}"
+    suffix = Path(name).suffix[:20]
+    return name[: 200 - len(suffix)] + suffix if len(name) > 200 else name
+
+
+def save_attachments(
+    attachments: list[tuple[dict[str, Any], bytes]], save_dir: str | None, pdf_text: bool
+) -> list[dict[str, Any]]:
+    """Write payloads to save_dir (never overwriting) and return the metadata list."""
+    if not save_dir:
+        return [meta for meta, _ in attachments]
+    directory = Path(save_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    for meta, payload in attachments:
+        name = safe_attachment_name(meta)
+        target = directory / name
+        counter = 1
+        while target.exists():
+            target = directory / f"{Path(name).stem}-{counter}{Path(name).suffix}"
+            counter += 1
+        target.write_bytes(payload)
+        saved = {**meta, "path": str(target)}
+        is_pdf = meta.get("content_type") == "application/pdf" or target.suffix.lower() == ".pdf"
+        if pdf_text and is_pdf:
+            text_path = target.with_suffix(".txt")
+            try:
+                subprocess.run(
+                    ["pdftotext", "-layout", str(target), str(text_path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+                saved["text_path"] = str(text_path)
+            except FileNotFoundError:
+                saved["text_error"] = "pdftotext not installed"
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                saved["text_error"] = f"pdftotext failed: {exc}"
+        results.append(saved)
+    return results
+
+
 def snippet(text: str, limit: int = 280) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip()
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 1].rstrip() + "..."
+
+
+def arg_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def gmail_query_value(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_.%+\-@=]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def internal_date_iso(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        timestamp = int(value) / 1000
+    except (TypeError, ValueError):
+        return None
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).isoformat()
+
+
+def message_sort_key(message: dict[str, Any]) -> str:
+    return str(message.get("date_iso") or message.get("date") or "")
+
+
+def normalized_subject(value: str | None) -> str:
+    subject = re.sub(r"\s+", " ", value or "").strip().lower()
+    while True:
+        cleaned = re.sub(r"^(re|fw|fwd):\s*", "", subject).strip()
+        if cleaned == subject:
+            return cleaned
+        subject = cleaned
+
+
+def message_participants(message: dict[str, Any]) -> list[str]:
+    values = [
+        str(message.get("from") or ""),
+        str(message.get("to") or ""),
+        str(message.get("cc") or ""),
+        str(message.get("bcc") or ""),
+    ]
+    found: list[str] = []
+    for name, addr in email.utils.getaddresses(values):
+        participant = addr or name
+        if participant and participant not in found:
+            found.append(participant)
+    return found
+
+
+def thread_participants(messages: list[dict[str, Any]]) -> list[str]:
+    participants: list[str] = []
+    for message in messages:
+        for participant in message_participants(message):
+            if participant not in participants:
+                participants.append(participant)
+    return participants
+
+
+def context_message(message: dict[str, Any]) -> dict[str, Any]:
+    allowed = [
+        "message_id",
+        "thread_id",
+        "date",
+        "date_iso",
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "snippet",
+        "labels",
+        "mailbox",
+    ]
+    return {key: message.get(key) for key in allowed if key in message}
+
+
+def thread_summary(
+    *,
+    account: dict[str, Any],
+    provider: str,
+    thread_id: str,
+    messages: list[dict[str, Any]],
+    messages_per_thread: int,
+    approximate: bool = False,
+) -> dict[str, Any]:
+    if not messages:
+        raise BridgeError("Cannot summarize an empty thread.")
+    newest_first = sorted(messages, key=message_sort_key, reverse=True)
+    latest = newest_first[0]
+    selected = sorted(newest_first[:messages_per_thread], key=message_sort_key)
+    return {
+        "account": account_id(account),
+        "account_email": account.get("email"),
+        "provider": provider,
+        "thread_id": thread_id,
+        "approximate_thread": approximate,
+        "subject": latest.get("subject") or "",
+        "latest_date": latest.get("date") or "",
+        "latest_date_iso": latest.get("date_iso"),
+        "participants": thread_participants(newest_first),
+        "message_count": len(messages),
+        "context": [context_message(message) for message in selected],
+    }
 
 
 def require_google_libs():
@@ -221,27 +403,58 @@ def gmail_headers(payload: dict[str, Any]) -> dict[str, str]:
         "from": normalize_header(by_name.get("from")),
         "to": normalize_header(by_name.get("to")),
         "cc": normalize_header(by_name.get("cc")),
+        "bcc": normalize_header(by_name.get("bcc")),
         "subject": normalize_header(by_name.get("subject")),
         "date": normalize_header(by_name.get("date")),
         "message_id_header": normalize_header(by_name.get("message-id")),
     }
 
 
-def build_gmail_query(query: str | None, since: dt.date | None, unread: bool) -> str:
+def build_gmail_query(args: argparse.Namespace) -> str:
     parts: list[str] = []
-    if query:
-        parts.append(query)
+    if getattr(args, "query", None):
+        parts.append(args.query)
+    if getattr(args, "sender", None):
+        parts.append(f"from:{gmail_query_value(args.sender)}")
+    if getattr(args, "subject", None):
+        parts.append(f"subject:{gmail_query_value(args.subject)}")
+    recipient_terms: list[str] = []
+    for recipient in arg_values(getattr(args, "recipient", None)):
+        value = gmail_query_value(recipient)
+        recipient_terms.extend([f"to:{value}", f"cc:{value}", f"bcc:{value}"])
+    if recipient_terms:
+        parts.append("{" + " ".join(recipient_terms) + "}")
+    since = parse_since(args)
     if since:
         parts.append("after:" + since.strftime("%Y/%m/%d"))
-    if unread:
+    if getattr(args, "unread", False):
         parts.append("is:unread")
     return " ".join(parts)
 
 
+def gmail_metadata_message(account: dict[str, Any], detail: dict[str, Any]) -> dict[str, Any]:
+    headers = gmail_headers(detail.get("payload", {}))
+    return {
+        "account": account_id(account),
+        "account_email": account.get("email"),
+        "provider": "gmail",
+        "message_id": detail.get("id"),
+        "thread_id": detail.get("threadId"),
+        "date": headers["date"],
+        "date_iso": parsed_date(headers["date"]) or internal_date_iso(detail.get("internalDate")),
+        "from": headers["from"],
+        "to": headers["to"],
+        "cc": headers["cc"],
+        "bcc": headers["bcc"],
+        "subject": headers["subject"],
+        "snippet": detail.get("snippet", ""),
+        "labels": detail.get("labelIds", []),
+    }
+
+
 def gmail_search(account: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
     service = gmail_service(account)
-    since = parse_since(args)
-    query = build_gmail_query(args.query, since, args.unread)
+    query = build_gmail_query(args)
     limit = args.limit
     found: list[dict[str, Any]] = []
     page_token = None
@@ -250,7 +463,7 @@ def gmail_search(account: dict[str, Any], args: argparse.Namespace) -> list[dict
             service.users()
             .messages()
             .list(userId="me", q=query, maxResults=min(100, limit - len(found)), pageToken=page_token)
-            .execute()
+            .execute(num_retries=GMAIL_READ_RETRIES)
         )
         messages = response.get("messages", [])
         if not messages:
@@ -265,32 +478,79 @@ def gmail_search(account: dict[str, Any], args: argparse.Namespace) -> list[dict
                     format="metadata",
                     metadataHeaders=GMAIL_METADATA_HEADERS,
                 )
-                .execute()
+                .execute(num_retries=GMAIL_READ_RETRIES)
             )
-            headers = gmail_headers(detail.get("payload", {}))
-            found.append(
-                {
-                    "account": account_id(account),
-                    "account_email": account.get("email"),
-                    "provider": "gmail",
-                    "message_id": detail.get("id"),
-                    "thread_id": detail.get("threadId"),
-                    "date": headers["date"],
-                    "date_iso": parsed_date(headers["date"]),
-                    "from": headers["from"],
-                    "to": headers["to"],
-                    "cc": headers["cc"],
-                    "subject": headers["subject"],
-                    "snippet": detail.get("snippet", ""),
-                    "labels": detail.get("labelIds", []),
-                }
-            )
+            found.append(gmail_metadata_message(account, detail))
             if len(found) >= limit:
                 break
         page_token = response.get("nextPageToken")
         if not page_token:
             break
     return found
+
+
+def gmail_recent_threads(account: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
+    service = gmail_service(account)
+    query = build_gmail_query(args)
+    scan_limit = max(args.limit, args.scan_limit)
+    seen: set[str] = set()
+    thread_ids: list[str] = []
+    page_token = None
+    scanned = 0
+    while len(thread_ids) < args.limit and scanned < scan_limit:
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=min(100, scan_limit - scanned),
+                pageToken=page_token,
+            )
+            .execute(num_retries=GMAIL_READ_RETRIES)
+        )
+        messages = response.get("messages", [])
+        if not messages:
+            break
+        for item in messages:
+            scanned += 1
+            thread_id = item.get("threadId")
+            if thread_id and thread_id not in seen:
+                seen.add(thread_id)
+                thread_ids.append(thread_id)
+                if len(thread_ids) >= args.limit:
+                    break
+            if scanned >= scan_limit:
+                break
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    summaries: list[dict[str, Any]] = []
+    for thread_id in thread_ids:
+        thread = (
+            service.users()
+            .threads()
+            .get(
+                userId="me",
+                id=thread_id,
+                format="metadata",
+                metadataHeaders=GMAIL_METADATA_HEADERS,
+            )
+            .execute(num_retries=GMAIL_READ_RETRIES)
+        )
+        messages = [gmail_metadata_message(account, item) for item in thread.get("messages", [])]
+        if messages:
+            summaries.append(
+                thread_summary(
+                    account=account,
+                    provider="gmail",
+                    thread_id=thread_id,
+                    messages=messages,
+                    messages_per_thread=args.messages_per_thread,
+                )
+            )
+    return summaries
 
 
 def gmail_payload_text(payload: dict[str, Any]) -> tuple[str, str]:
@@ -315,12 +575,55 @@ def gmail_payload_text(payload: dict[str, Any]) -> tuple[str, str]:
     return "\n\n".join(p for p in plain_parts if p), "\n\n".join(p for p in html_parts if p)
 
 
-def gmail_read(account: dict[str, Any], message_id: str) -> dict[str, Any]:
+def gmail_attachments(service: Any, message_id: str, payload: dict[str, Any]) -> list[tuple[dict[str, Any], bytes]]:
+    found: list[tuple[dict[str, Any], bytes]] = []
+
+    def decode(data: str) -> bytes:
+        return base64.urlsafe_b64decode((data + "=" * (-len(data) % 4)).encode())
+
+    def walk(part: dict[str, Any]) -> None:
+        body = part.get("body", {}) or {}
+        filename = part.get("filename") or ""
+        if (filename or body.get("attachmentId")) and not part.get("parts"):
+            if body.get("data"):
+                data = decode(body["data"])
+            else:
+                fetched = (
+                    service.users()
+                    .messages()
+                    .attachments()
+                    .get(userId="me", messageId=message_id, id=body["attachmentId"])
+                    .execute(num_retries=GMAIL_READ_RETRIES)
+                )
+                data = decode(fetched.get("data", ""))
+            meta = {
+                "index": len(found),
+                "filename": filename,
+                "content_type": part.get("mimeType", ""),
+                "size": len(data),
+            }
+            found.append((meta, data))
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+    return found
+
+
+def gmail_read(
+    account: dict[str, Any], message_id: str, save_dir: str | None = None, pdf_text: bool = False
+) -> dict[str, Any]:
     service = gmail_service(account)
-    detail = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    detail = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute(num_retries=GMAIL_READ_RETRIES)
+    )
     headers = gmail_headers(detail.get("payload", {}))
     plain, html_text = gmail_payload_text(detail.get("payload", {}))
     body = plain or html_text
+    attachments = gmail_attachments(service, detail.get("id") or message_id, detail.get("payload", {}))
     return {
         "account": account_id(account),
         "account_email": account.get("email"),
@@ -332,10 +635,12 @@ def gmail_read(account: dict[str, Any], message_id: str) -> dict[str, Any]:
         "from": headers["from"],
         "to": headers["to"],
         "cc": headers["cc"],
+        "bcc": headers["bcc"],
         "subject": headers["subject"],
         "snippet": detail.get("snippet", ""),
         "labels": detail.get("labelIds", []),
         "body": body,
+        "attachments": save_attachments(attachments, save_dir, pdf_text),
     }
 
 
@@ -409,7 +714,7 @@ def gmail_create_draft(account: dict[str, Any], args: argparse.Namespace) -> dic
                 format="metadata",
                 metadataHeaders=["Message-ID", "References", "Subject"],
             )
-            .execute()
+            .execute(num_retries=GMAIL_READ_RETRIES)
         )
         thread_id = thread_id or source.get("threadId")
         headers = {
@@ -468,7 +773,7 @@ def gmail_send(account: dict[str, Any], args: argparse.Namespace) -> dict[str, A
                 format="metadata",
                 metadataHeaders=["Message-ID", "References", "Subject"],
             )
-            .execute()
+            .execute(num_retries=GMAIL_READ_RETRIES)
         )
         thread_id = thread_id or source.get("threadId")
         headers = {
@@ -562,11 +867,25 @@ def imap_criteria(args: argparse.Namespace) -> list[str]:
         criteria.extend(["FROM", imap_quote(args.sender)])
     if args.subject:
         criteria.extend(["SUBJECT", imap_quote(args.subject)])
+    recipient_terms: list[list[str]] = []
+    for recipient in arg_values(getattr(args, "recipient", None)):
+        quoted = imap_quote(recipient)
+        recipient_terms.extend([["TO", quoted], ["CC", quoted], ["BCC", quoted]])
+    if recipient_terms:
+        criteria.extend(imap_or(recipient_terms))
     return criteria
 
 
+def imap_or(terms: list[list[str]]) -> list[str]:
+    if not terms:
+        return []
+    if len(terms) == 1:
+        return terms[0]
+    return ["OR"] + terms[0] + imap_or(terms[1:])
+
+
 def imap_fetch_header(conn: imaplib.IMAP4_SSL, uid: bytes) -> email.message.Message:
-    status, data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)] FLAGS)")
+    status, data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC SUBJECT DATE MESSAGE-ID)] FLAGS)")
     if status != "OK":
         raise BridgeError(f"Could not fetch IMAP header for UID {uid.decode()}.")
     for item in data:
@@ -598,6 +917,7 @@ def imap_search(account: dict[str, Any], args: argparse.Namespace) -> list[dict[
                     "from": headers["from"],
                     "to": headers["to"],
                     "cc": headers["cc"],
+                    "bcc": headers["bcc"],
                     "subject": headers["subject"],
                     "snippet": "",
                     "mailbox": account.get("mailbox") or "INBOX",
@@ -611,10 +931,12 @@ def imap_search(account: dict[str, Any], args: argparse.Namespace) -> list[dict[
             pass
 
 
-def imap_read(account: dict[str, Any], message_id: str) -> dict[str, Any]:
+def imap_read(
+    account: dict[str, Any], message_id: str, save_dir: str | None = None, pdf_text: bool = False
+) -> dict[str, Any]:
     conn = imap_connect(account)
     try:
-        status, data = conn.uid("FETCH", message_id.encode(), "(RFC822)")
+        status, data = conn.uid("FETCH", message_id.encode(), "(BODY.PEEK[])")
         if status != "OK":
             raise BridgeError(f"{account_id(account)} could not fetch IMAP UID {message_id}.")
         raw = None
@@ -637,16 +959,59 @@ def imap_read(account: dict[str, Any], message_id: str) -> dict[str, Any]:
             "from": headers["from"],
             "to": headers["to"],
             "cc": headers["cc"],
+            "bcc": headers["bcc"],
             "subject": headers["subject"],
             "snippet": snippet(body),
             "mailbox": account.get("mailbox") or "INBOX",
             "body": body,
+            "attachments": save_attachments(email_message_attachments(msg), save_dir, pdf_text),
         }
     finally:
         try:
             conn.logout()
         except Exception:
             pass
+
+
+def imap_recent_threads(account: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
+    scan_args = argparse.Namespace(**vars(args))
+    scan_args.limit = max(args.scan_limit, args.limit * args.messages_per_thread)
+    messages = imap_search(account, scan_args)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for message in messages:
+        subject_key = normalized_subject(message.get("subject"))
+        key = f"subject:{subject_key}" if subject_key else f"uid:{message.get('message_id')}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(message)
+
+    summaries: list[dict[str, Any]] = []
+    for key in order[: args.limit]:
+        group = groups[key]
+        hydrated: list[dict[str, Any]] = []
+        for message in sorted(group, key=message_sort_key, reverse=True)[: args.messages_per_thread]:
+            try:
+                hydrated_message = imap_read(account, str(message["message_id"]))
+                hydrated_message.pop("body", None)
+                hydrated.append(hydrated_message)
+            except BridgeError:
+                hydrated.append(message)
+        all_messages_by_id = {str(message.get("message_id")): message for message in group}
+        for hydrated_message in hydrated:
+            all_messages_by_id[str(hydrated_message.get("message_id"))] = hydrated_message
+        summaries.append(
+            thread_summary(
+                account=account,
+                provider="imap",
+                thread_id=key,
+                messages=list(all_messages_by_id.values()),
+                messages_per_thread=args.messages_per_thread,
+                approximate=True,
+            )
+        )
+    return summaries
 
 
 def imap_create_draft(account: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -843,6 +1208,17 @@ def cmd_config_template(_: argparse.Namespace) -> None:
     )
 
 
+def account_error(account: dict[str, Any], exc: Exception) -> dict[str, str]:
+    if isinstance(exc, BridgeError):
+        error = str(exc)
+    else:
+        error = f"{type(exc).__name__}: {exc}"
+    error = " ".join(error.split())
+    if len(error) > 500:
+        error = error[:497].rstrip() + "..."
+    return {"account": account_id(account), "error": error}
+
+
 def cmd_search(args: argparse.Namespace) -> None:
     config = load_config(Path(args.config).expanduser())
     selected = select_accounts(config, args.account)
@@ -857,10 +1233,30 @@ def cmd_search(args: argparse.Namespace) -> None:
                 results.extend(imap_search(account, args))
             else:
                 raise BridgeError(f"Unsupported provider: {provider}")
-        except BridgeError as exc:
-            errors.append({"account": account_id(account), "error": str(exc)})
+        except Exception as exc:
+            errors.append(account_error(account, exc))
     results.sort(key=lambda item: item.get("date_iso") or item.get("date") or "", reverse=True)
     json_print({"ok": not errors, "results": results[: args.limit], "errors": errors})
+
+
+def cmd_recent(args: argparse.Namespace) -> None:
+    config = load_config(Path(args.config).expanduser())
+    selected = select_accounts(config, args.account)
+    threads: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for account in selected:
+        provider = str(account.get("provider") or "").lower()
+        try:
+            if provider == "gmail":
+                threads.extend(gmail_recent_threads(account, args))
+            elif provider == "imap":
+                threads.extend(imap_recent_threads(account, args))
+            else:
+                raise BridgeError(f"Unsupported provider: {provider}")
+        except Exception as exc:
+            errors.append(account_error(account, exc))
+    threads.sort(key=lambda item: item.get("latest_date_iso") or item.get("latest_date") or "", reverse=True)
+    json_print({"ok": not errors, "threads": threads[: args.limit], "errors": errors})
 
 
 def cmd_read(args: argparse.Namespace) -> None:
@@ -870,10 +1266,12 @@ def cmd_read(args: argparse.Namespace) -> None:
         raise BridgeError("read requires exactly one account.")
     account = selected[0]
     provider = str(account.get("provider") or "").lower()
+    if args.pdf_text and not args.save_attachments:
+        raise BridgeError("--pdf-text requires --save-attachments DIR.")
     if provider == "gmail":
-        result = gmail_read(account, args.message_id)
+        result = gmail_read(account, args.message_id, args.save_attachments, args.pdf_text)
     elif provider == "imap":
-        result = imap_read(account, args.message_id)
+        result = imap_read(account, args.message_id, args.save_attachments, args.pdf_text)
     else:
         raise BridgeError(f"Unsupported provider: {provider}")
     json_print({"ok": True, "message": result})
@@ -925,13 +1323,29 @@ def cmd_setup_gmail(args: argparse.Namespace) -> None:
     else:
         scopes = [GMAIL_MODIFY_SCOPE]
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secret), scopes)
-    creds = flow.run_local_server(port=0)
+    creds = flow.run_local_server(port=0, open_browser=not args.no_browser)
     token_path.write_text(creds.to_json())
     json_print({"ok": True, "token_path": str(token_path), "scopes": scopes})
 
 
 def add_common_config_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=str(CONFIG_PATH), help=f"Config JSON path (default: {CONFIG_PATH})")
+
+
+def add_search_filter_args(parser: argparse.ArgumentParser, *, recipient_required: bool = False) -> None:
+    parser.add_argument("--account", action="append", help="Account id or email. Repeat to query several.")
+    parser.add_argument("--query", help="Gmail query string or IMAP text search.")
+    parser.add_argument("--sender", help="Filter by sender email/name.")
+    parser.add_argument(
+        "--recipient",
+        action="append",
+        required=recipient_required,
+        help="Filter by direct recipient in To/Cc/Bcc. Repeat for several.",
+    )
+    parser.add_argument("--subject", help="Filter by subject text.")
+    parser.add_argument("--since", help="Start date YYYY-MM-DD.")
+    parser.add_argument("--days", type=int, help="Search back this many days.")
+    parser.add_argument("--unread", action="store_true", help="Only unread messages.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -948,20 +1362,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = sub.add_parser("search", help="Search configured accounts and return message metadata.")
     add_common_config_arg(search)
-    search.add_argument("--account", action="append", help="Account id or email. Repeat to query several.")
-    search.add_argument("--query", help="Gmail query string or IMAP text search.")
-    search.add_argument("--sender", help="IMAP sender filter. For Gmail, use --query 'from:addr'.")
-    search.add_argument("--subject", help="IMAP subject filter. For Gmail, use --query 'subject:term'.")
-    search.add_argument("--since", help="Start date YYYY-MM-DD.")
-    search.add_argument("--days", type=int, help="Search back this many days.")
-    search.add_argument("--unread", action="store_true", help="Only unread messages.")
+    add_search_filter_args(search)
     search.add_argument("--limit", type=int, default=25, help="Maximum combined results.")
     search.set_defaults(func=cmd_search)
+
+    recipient_search = sub.add_parser("recipient-search", help="Search messages by To/Cc/Bcc recipient.")
+    add_common_config_arg(recipient_search)
+    add_search_filter_args(recipient_search, recipient_required=True)
+    recipient_search.add_argument("--limit", type=int, default=25, help="Maximum combined results.")
+    recipient_search.set_defaults(func=cmd_search)
+
+    recent = sub.add_parser("recent", help="Show recent thread summaries with context messages.")
+    add_common_config_arg(recent)
+    add_search_filter_args(recent)
+    recent.add_argument("--limit", type=int, default=10, help="Maximum combined threads.")
+    recent.add_argument("--messages-per-thread", type=int, default=3, help="Context messages to include per thread.")
+    recent.add_argument("--scan-limit", type=int, default=100, help="Messages to scan while finding recent threads.")
+    recent.set_defaults(func=cmd_recent)
 
     read = sub.add_parser("read", help="Read one message body.")
     add_common_config_arg(read)
     read.add_argument("--account", required=True, help="Account id or email.")
     read.add_argument("--message-id", required=True, help="Gmail message id or IMAP UID from search results.")
+    read.add_argument(
+        "--save-attachments",
+        metavar="DIR",
+        help="Write attachments into DIR (created if missing; existing files are never overwritten).",
+    )
+    read.add_argument(
+        "--pdf-text",
+        action="store_true",
+        help="With --save-attachments, also write a pdftotext -layout .txt beside each saved PDF.",
+    )
     read.set_defaults(func=cmd_read)
 
     create_draft = sub.add_parser("create-draft", help="Create a Gmail or iCloud draft.")
@@ -1000,6 +1432,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["readonly", "compose", "modify"],
         default="compose",
         help="OAuth scopes to request. Default compose supports search/read and draft creation.",
+    )
+    setup_gmail.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the OAuth URL instead of opening the system browser.",
     )
     setup_gmail.set_defaults(func=cmd_setup_gmail)
 

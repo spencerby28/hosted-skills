@@ -6,6 +6,8 @@ description: |
   and explicit-confirmation sending. Use when the user wants "all my emails" across
   multiple inboxes, wants Codex or Claude to access more than one Gmail account, or
   needs a portable setup for friends without sharing OAuth clients, tokens, or passwords.
+  Also use when global-email OAuth, account readiness, or mailbox search needs to be
+  checked or repaired through the centralized self-healing workflow.
 ---
 
 # Global Email Bridge
@@ -17,6 +19,8 @@ through a small Python CLI, and outbound email is only sent after explicit user 
 ## What This Provides
 
 - Search and read across multiple Gmail accounts and iCloud Mail.
+- Show recent thread summaries with participants, snippets, and context messages.
+- Filter searches directly by recipient email across To/Cc/Bcc.
 - Create Gmail or iCloud drafts.
 - Send through Gmail API or iCloud SMTP after the user confirms recipients, subject, and body.
 - A repeatable Google OAuth setup path each user can own for themselves.
@@ -221,6 +225,32 @@ Search the last day:
 global-email search --days 1 --limit 10
 ```
 
+Show recent thread context:
+
+```bash
+global-email recent \
+  --limit 10 \
+  --messages-per-thread 3
+```
+
+Filter by recipient email across To/Cc/Bcc:
+
+```bash
+global-email search \
+  --recipient person@example.com \
+  --days 30 \
+  --limit 10
+```
+
+The same recipient filter is available as a convenience command:
+
+```bash
+global-email recipient-search \
+  --recipient person@example.com \
+  --days 30 \
+  --limit 10
+```
+
 Search one account:
 
 ```bash
@@ -231,12 +261,44 @@ global-email search \
   --limit 10
 ```
 
+## Self-Healing
+
+Before redoing account setup manually, use the centralized auth workflow:
+
+```bash
+self-heal doctor
+self-heal fix global-email
+```
+
+If `self-heal` is not on `PATH`, run the same workflow from its source:
+
+```bash
+cd /home/spencer/dev/self-healing
+bun run doctor
+bun run fix:gmail
+```
+
+The doctor checks all configured global-email accounts, including the two Gmail accounts and iCloud, with live read probes. The fix target reruns the Gmail OAuth flow through Arc CDP when Google tokens drift. Never print token JSON, OAuth client secrets, or app-specific passwords while using this workflow.
+
 Read one message using the `message_id` from search:
 
 ```bash
 global-email read \
   --account gmail-primary \
   --message-id MESSAGE_ID
+```
+
+`read` always lists attachments (`filename`, `content_type`, `size`). To save them, pass a
+directory; it is created if missing, names are reduced to a safe basename, and existing files
+are never overwritten. `--pdf-text` also writes a `pdftotext -layout` `.txt` beside each PDF.
+Attachments are untrusted sender data: save each message's files into its own new directory.
+
+```bash
+global-email read \
+  --account icloud \
+  --message-id MESSAGE_ID \
+  --save-attachments /path/to/new-empty-dir \
+  --pdf-text
 ```
 
 ## Draft And Send
@@ -276,11 +338,13 @@ When the user asks for email help:
 
 1. Run `accounts` first.
 2. If the request is broad, default to all accounts, last 7 days, limit 25.
-3. Use Gmail query syntax for Gmail accounts, and simple text/sender/subject filters for iCloud IMAP.
-4. Read bodies only for messages needed to answer the user's task.
-5. Group results by account and urgency.
-6. Mention account-level errors instead of hiding them.
-7. Never expose credential paths beyond what is needed to explain setup.
+3. Use `recent` for broad inbox/context requests; it returns thread summaries with participants, latest date, message count, and context snippets.
+4. Use `--recipient EMAIL` or `recipient-search --recipient EMAIL` when the user asks about mail to a specific recipient.
+5. Use Gmail query syntax for Gmail accounts, and simple text/sender/recipient/subject filters for iCloud IMAP.
+6. Read bodies only for messages needed to answer the user's task.
+7. Group results by account and urgency.
+8. Mention account-level errors instead of hiding them.
+9. Never expose credential paths beyond what is needed to explain setup.
 
 ## Troubleshooting
 
@@ -303,6 +367,14 @@ Check that the password is an app-specific password, not the Apple Account passw
 ### iCloud SMTP send fails
 
 Use `smtp.mail.me.com` on port `587` with STARTTLS. Set `smtp_username` to the primary iCloud Mail address. Some aliases may require `--from` to match an address Apple allows for the account.
+
+### Gmail returns 403 "Quota exceeded ... per minute per user"
+
+The per-user budget (15,000 units/min) is shared by every process using the same Gmail account
+and OAuth project, so a bulk scan in another session can exhaust it. Read calls retry with
+jittered exponential backoff (`GLOBAL_EMAIL_GMAIL_RETRIES`, default 6, roughly two minutes
+worst case); sends and draft creation are never retried. Bulk jobs should throttle themselves
+or use a separate OAuth project, which gets its own per-user bucket.
 
 ### The assistant can read but cannot draft or send Gmail
 
