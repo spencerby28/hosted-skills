@@ -907,11 +907,33 @@ def run_batches(service: Any, ids: list[str], make_request, chunk: int, label: s
     return done, pending
 
 
+def read_ids_file(path: str) -> list[str]:
+    """Accept {"ids": [...]}, a JSON list, JSONL with an "id" field, or one id per line."""
+    text = Path(path).expanduser().read_text()
+    try:
+        data = json.loads(text)
+        ids = data.get("ids") if isinstance(data, dict) else data
+        if isinstance(ids, list):
+            return [str(i) for i in ids if str(i).strip()]
+    except json.JSONDecodeError:
+        pass
+    found = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        found.append(str(json.loads(line)["id"]) if line.startswith("{") else line)
+    return found
+
+
 def gmail_clean(account: dict[str, Any], args: argparse.Namespace, service: Any = None) -> dict[str, Any]:
     action = args.action
     senders, labels = clean_protections(account, args)
-    query = clean_query(args.query, senders, labels, action)
-    include_spam_trash = action in {"delete", "untrash"} or bool(re.search(r"\bin:(trash|spam)\b", args.query))
+    ids_file = getattr(args, "ids_file", None)
+    if ids_file and args.query:
+        raise BridgeError("Use --query or --ids-file, not both.")
+    query = f"ids-file:{ids_file}" if ids_file else clean_query(args.query or "", senders, labels, action)
+    include_spam_trash = action in {"delete", "untrash"} or bool(re.search(r"\bin:(trash|spam)\b", args.query or ""))
     if args.execute:
         granted = gmail_token_scopes(account)
         if not granted & CLEAN_ACTION_SCOPES[action]:
@@ -923,7 +945,12 @@ def gmail_clean(account: dict[str, Any], args: argparse.Namespace, service: Any 
         if action == "label" and not (args.add_label or args.remove_label):
             raise BridgeError("--action label needs --add-label and/or --remove-label.")
     service = service or gmail_service(account)
-    ids = gmail_list_ids(service, query, args.limit, include_spam_trash)
+    if ids_file:
+        # Frozen ids: no live search. Protection is checked on the sampled messages below.
+        ids = list(dict.fromkeys(read_ids_file(ids_file)))
+        ids = ids[: args.limit] if args.limit > 0 else ids
+    else:
+        ids = gmail_list_ids(service, query, args.limit, include_spam_trash)
     result: dict[str, Any] = {
         "account": account_id(account),
         "action": action,
@@ -1669,7 +1696,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_config_arg(clean)
     clean.add_argument("--account", required=True, help="Gmail account id or email.")
-    clean.add_argument("--query", required=True, help="Gmail search query selecting the messages.")
+    target = clean.add_mutually_exclusive_group(required=True)
+    target.add_argument("--query", help="Gmail search query selecting the messages.")
+    target.add_argument(
+        "--ids-file",
+        help='Act on frozen message ids instead of a live search: {"ids": [...]}, a JSON list, JSONL, or one per line.',
+    )
     clean.add_argument(
         "--action",
         choices=sorted(CLEAN_ACTION_SCOPES),

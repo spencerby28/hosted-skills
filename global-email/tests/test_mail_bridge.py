@@ -83,7 +83,7 @@ def make_store(n, sender="news@shop.example", size=1000):
 
 
 def args(**kw):
-    base = dict(query="category:promotions", action="trash", add_label=None, remove_label=None,
+    base = dict(query="category:promotions", ids_file=None, action="trash", add_label=None, remove_label=None,
                 protect_sender=None, protect_label=None, limit=0, size_sample=0, manifest=None, execute=False)
     base.update(kw)
     return argparse.Namespace(**base)
@@ -164,6 +164,26 @@ class CleanTests(unittest.TestCase):
         res = mb.gmail_clean(self.account([mb.GMAIL_READONLY_SCOPE]), args(limit=600, size_sample=1), svc)
         self.assertEqual(res["matched"], 600)
         self.assertTrue(res["matched_is_capped"])
+
+    def test_ids_file_uses_frozen_ids_without_search(self):
+        svc = FakeService(make_store(10))
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"tier": "D1", "ids": ["m00001", "m00002", "m00002", "m00009"]}, f)
+        res = mb.gmail_clean(self.account([mb.GMAIL_MODIFY_SCOPE]),
+                             args(query=None, ids_file=f.name, execute=True, size_sample=0), svc)
+        self.assertEqual(res["matched"], 3)
+        self.assertFalse([e for e in svc.log if e[0] == "list"])
+        self.assertEqual(sorted(e[1] for e in svc.log if e[0] == "trash"), ["m00001", "m00002", "m00009"])
+
+    def test_ids_file_guard_still_checks_sample(self):
+        store = make_store(4)
+        store["m00002"]["labels"] = ["STARRED"]
+        svc = FakeService(store)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("m00001\nm00002\n")
+        with self.assertRaises(mb.BridgeError):
+            mb.gmail_clean(self.account([mb.GMAIL_MODIFY_SCOPE]), args(query=None, ids_file=f.name, execute=True), svc)
+        self.assertFalse([e for e in svc.log if e[0] == "trash"])
 
     def test_scope_sets(self):
         self.assertEqual(mb.GMAIL_SCOPE_SETS["full"], ["https://mail.google.com/"])

@@ -331,6 +331,8 @@ global-email clean --account gmail-personal --query "in:trash" --action delete -
   `protected_labels` on the account in `accounts.json`. Exclusions are added to the Gmail query, and a sample of the
   matched messages is checked again right before any change. If a protected message shows up, nothing is changed.
 - Trashed mail still counts toward storage until Trash is emptied. Gmail empties it automatically after 30 days.
+- `--ids-file FILE` acts on frozen message ids (`{"ids": [...]}`, a JSON list, JSONL or one per line) instead of a live
+  query, so a reviewed list is exactly what gets changed. Guards are then checked on the sample.
 - Other actions: `archive` (remove from Inbox), `label --add-label ID --remove-label ID`, `untrash`.
 - Each action checks the token's scopes first and names the `setup-gmail` command to run if a scope is missing.
 
